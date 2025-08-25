@@ -24,6 +24,15 @@
 import json
 import logging
 import azure.functions as func
+import os
+
+from azure.storage.blob.aio import BlobServiceClient
+
+# Lazy import placeholder for cosmos operations (import inside function to avoid startup failure when env vars missing)
+try:
+    from data import cosmos_ops  # type: ignore
+except Exception:
+    cosmos_ops = None  # Will handle inside health check
 
 app = func.FunctionApp()
 
@@ -118,12 +127,75 @@ async def http_health_check_extended(req: func.HttpRequest) -> func.HttpResponse
     Returns:
         JSON response with status "ok" and 200 status code
     """
-    # TODO: verify connection to storage account and specifically INGESTION_CONTAINER is working (see environment variables)
-    # TODO: verify connection to cosmosDB is working
-    
+    # Storage account verification
+    storage_status: str = "ok"
+    cosmos_status: str = "skipped"
+    try:
+        storage_conn_str = os.environ["AzureWebJobsStorage"]
+        ingestion_container = os.environ["INGESTION_CONTAINER"]
+        blob_service_client = BlobServiceClient.from_connection_string(storage_conn_str)
+        container_client = blob_service_client.get_container_client(ingestion_container)
+        # Try listing blobs to verify access (limit to first)
+        async for _ in container_client.list_blobs(results_per_page=1):  # type: ignore[arg-type]
+            break
+        logging.info(
+            f"Storage account and container '{ingestion_container}' are accessible"
+        )
+    except Exception as e:
+        storage_status = f"error: {e}"
+        logging.error(f"Storage health check failed: {e}")
+        return func.HttpResponse(
+            body=json.dumps(
+                {"status": "error", "storage": storage_status, "cosmos": cosmos_status}
+            ),
+            mimetype="application/json",
+            status_code=500,
+        )
+
+    # Cosmos DB verification (only if module imported successfully)
+    if cosmos_ops is not None:
+        try:
+            # Get container (creates if not exists) and run a very lightweight query
+            container = await cosmos_ops.get_container()  # type: ignore[attr-defined]
+            query_iter = container.query_items(
+                query=(
+                    "SELECT TOP 1 c.id FROM c WHERE c.type = 'code-snippet'"
+                )
+            )
+            # Consume at most one item
+            async for _ in query_iter:
+                break
+            cosmos_status = "ok"
+            logging.info("Cosmos DB is accessible and query executed")
+        except Exception as e:
+            cosmos_status = f"error: {e}"
+            logging.error(f"Cosmos DB health check failed: {e}")
+            return func.HttpResponse(
+                body=json.dumps(
+                    {
+                        "status": "error",
+                        "storage": storage_status,
+                        "cosmos": cosmos_status,
+                    }
+                ),
+                mimetype="application/json",
+                status_code=500,
+            )
+    else:
+        cosmos_status = "module-import-failed"
+        logging.warning(
+            "cosmos_ops module not available; skipping Cosmos DB health check"
+        )
+
     logging.info("Extended Health check endpoint called")
     return func.HttpResponse(
-        body=json.dumps({"status": "I'm a teapot?!?"}),
+        body=json.dumps(
+            {
+                "status": "OK",
+                "storage": storage_status,
+                "cosmos": cosmos_status,
+            }
+        ),
         mimetype="application/json",
-        status_code=418
+        status_code=200,
     )
